@@ -5,7 +5,11 @@
 // Importación masiva de parcelas desde un Excel subido por el propio usuario.
 //
 // Formato de columnas esperado (en este orden, con cabecera en la fila 1):
-//   grupo | nombre_parcela | sigpac_ref | cultivo | fecha_plantacion | finca | observaciones
+//   grupo | nombre_parcela | sigpac_ref | cultivo | fecha_plantacion | finca | campana | observaciones | superficie
+//
+// - `superficie` (ha, OPCIONAL, una por fila/recinto): superficie realmente cultivada. La parcela se
+//   dibuja entera (geometría completa del recinto SIGPAC), pero su superficie es la indicada aquí.
+//   Si es mayor que la superficie SIGPAC de ese recinto se usa la de SIGPAC; si se deja vacía, también.
 //
 // - `grupo`: filas con el mismo valor de `grupo` se agrupan en UNA sola parcela
 //   con varios recintos SIGPAC (una fila por cada sigpac_ref). Es OPCIONAL: una
@@ -33,6 +37,7 @@ import { supabase } from '../lib/supabaseClient'
 import { CAT, buscarPorNombreExacto } from '../lib/catalogos'
 import {
   construirEstadoDesdeFeatures,
+  extraerRecinto,
   formatRefSigpac,
   parsearRefSigpacTexto,
   RecintoRef,
@@ -83,6 +88,7 @@ interface FilaExcel {
   finca: string
   campana: string
   observaciones: string
+  superficie: string // texto tal cual venga del Excel (ha); vacío = usar la de SIGPAC
   _fila: number // nº de fila en el Excel (para mensajes de error)
 }
 
@@ -97,7 +103,9 @@ interface ParcelaPreview {
   observaciones: string
   refs: RecintoRef[]
   refsTexto: string[]
-  supTotalHa: number
+  supTotalHa: number        // superficie efectiva de la parcela (la declarada, limitada a la de SIGPAC)
+  supSigpacHa: number       // superficie total SIGPAC de los recintos (la que se dibuja)
+  avisosSuperficie: string[] // p. ej. "superficie ajustada a la de SIGPAC"
   features: any[] // features SIGPAC crudos ya resueltos, listos para fusionar en la confirmación
 }
 
@@ -119,7 +127,7 @@ interface Props {
 
 type Fase = 'subida' | 'procesando' | 'preview' | 'fechas_campanas' | 'importando' | 'hecho'
 
-const COLUMNAS_ESPERADAS = ['grupo', 'nombre_parcela', 'sigpac_ref', 'cultivo', 'fecha_plantacion', 'finca', 'campana', 'observaciones']
+const COLUMNAS_ESPERADAS = ['grupo', 'nombre_parcela', 'sigpac_ref', 'cultivo', 'fecha_plantacion', 'finca', 'campana', 'observaciones', 'superficie']
 
 // Ejecuta `tareas` con un límite de concurrencia, para no saturar el servicio SIGPAC.
 async function ejecutarConConcurrencia<T>(items: T[], limite: number, fn: (item: T, idx: number) => Promise<void>) {
@@ -151,19 +159,19 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
     const filaEjemplo1 = {
       grupo: '1', nombre_parcela: 'El Olivar', sigpac_ref: '41/7/0/0/6/7/3',
       cultivo: 'Olivo', fecha_plantacion: '2015-03-01', finca: 'Finca Norte',
-      campana: '', observaciones: 'Riego por goteo',
+      campana: '', observaciones: 'Riego por goteo', superficie: 2.5,
     }
     const filaEjemplo2 = {
       grupo: '1', nombre_parcela: '', sigpac_ref: '41/7/0/0/6/8/1',
-      cultivo: '', fecha_plantacion: '', finca: '', campana: '', observaciones: '',
+      cultivo: '', fecha_plantacion: '', finca: '', campana: '', observaciones: '', superficie: '',
     }
     const filaEjemplo3 = {
       grupo: '2', nombre_parcela: 'La Vega', sigpac_ref: '41/7/0/0/9/2/1',
       cultivo: 'Trigo', fecha_plantacion: '2024-11-15', finca: 'Finca Norte',
-      campana: 'Cereal 2024/2025', observaciones: '',
+      campana: 'Cereal 2024/2025', observaciones: '', superficie: '',
     }
     const ws = XLSX.utils.json_to_sheet([filaEjemplo1, filaEjemplo2, filaEjemplo3], { header: COLUMNAS_ESPERADAS })
-    ws['!cols'] = [{ wch: 8 }, { wch: 20 }, { wch: 20 }, { wch: 14 }, { wch: 16 }, { wch: 18 }, { wch: 18 }, { wch: 30 }]
+    ws['!cols'] = [{ wch: 8 }, { wch: 20 }, { wch: 20 }, { wch: 14 }, { wch: 16 }, { wch: 18 }, { wch: 18 }, { wch: 30 }, { wch: 12 }]
     const wb = XLSX.utils.book_new()
     XLSX.utils.book_append_sheet(wb, ws, 'Parcelas')
     XLSX.writeFile(wb, 'kampo_plantilla_parcelas.xlsx')
@@ -226,13 +234,14 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
           finca: getCol(row, 'finca'),
           campana: getCol(row, 'campana'),
           observaciones: getCol(row, 'observaciones'),
+          superficie: getCol(row, 'superficie'),
           _fila: i + 2, // +2: fila 1 es cabecera, i es 0-indexed
         }
       }).filter(f =>
         // Descarta solo filas realmente en blanco (típico de filas sobrantes al final del Excel).
         // Cualquier dato presente (aunque falte sigpac_ref) se conserva para poder avisar del error.
         f.sigpac_ref !== '' || f.nombre_parcela !== '' || f.cultivo !== '' ||
-        f.fecha_plantacion !== '' || f.finca !== '' || f.campana !== '' || f.observaciones !== '' || !f.esIndividual
+        f.fecha_plantacion !== '' || f.finca !== '' || f.campana !== '' || f.observaciones !== '' || f.superficie !== '' || !f.esIndividual
       )
 
       // Agrupa por `grupo` (real o sintético)
@@ -247,7 +256,7 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
       const erroresLocal: ErrorPreview[] = []
 
       // Prepara la lista plana de refs a resolver (una por fila con sigpac_ref válido)
-      type RefAPedir = { grupo: string; fila: number; ref: ReturnType<typeof parsearRefSigpacTexto>; textoOriginal: string }
+      type RefAPedir = { grupo: string; fila: number; ref: ReturnType<typeof parsearRefSigpacTexto>; textoOriginal: string; declaradaHa?: number }
       const refsAPedir: RefAPedir[] = []
       grupos.forEach((filasGrupo, grupo) => {
         filasGrupo.forEach(f => {
@@ -260,7 +269,17 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
             erroresLocal.push({ grupo, fila: f._fila, motivo: `Referencia SIGPAC con formato inválido: "${f.sigpac_ref}" (debe ser 7 números separados por "/").` })
             return
           }
-          refsAPedir.push({ grupo, fila: f._fila, ref: parsed, textoOriginal: f.sigpac_ref })
+          // Superficie declarada (opcional): admite coma o punto decimal
+          let declaradaHa: number | undefined
+          if (f.superficie !== '') {
+            const n = Number(f.superficie.replace(/\s/g, '').replace(',', '.'))
+            if (!isFinite(n) || n <= 0) {
+              erroresLocal.push({ grupo, fila: f._fila, motivo: `Superficie no válida: "${f.superficie}" (debe ser un número mayor que 0, en hectáreas).` })
+              return
+            }
+            declaradaHa = n
+          }
+          refsAPedir.push({ grupo, fila: f._fila, ref: parsed, textoOriginal: f.sigpac_ref, declaradaHa })
         })
       })
 
@@ -296,6 +315,8 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
 
       // Agrupa resultados por grupo; si CUALQUIER ref de un grupo falla, todo el grupo va a errores
       const featuresPorGrupo = new Map<string, any[]>()
+      const supEfectivaPorGrupo = new Map<string, number>()
+      const avisosPorGrupo = new Map<string, string[]>()
       const grupoConError = new Set<string>()
 
       refsAPedir.forEach((item, idx) => {
@@ -306,6 +327,19 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
         } else {
           if (!featuresPorGrupo.has(item.grupo)) featuresPorGrupo.set(item.grupo, [])
           featuresPorGrupo.get(item.grupo)!.push(...res.features)
+
+          // Superficie efectiva de esta fila: la declarada si es menor que la de SIGPAC;
+          // si es mayor (o no se indicó), la de SIGPAC.
+          const supSigpacFila = res.features.reduce((acc: number, f: any) => acc + extraerRecinto(f.properties || {}).supHa, 0)
+          let efectiva = supSigpacFila
+          if (item.declaradaHa !== undefined) {
+            if (item.declaradaHa <= supSigpacFila + 1e-6) efectiva = item.declaradaHa
+            else {
+              if (!avisosPorGrupo.has(item.grupo)) avisosPorGrupo.set(item.grupo, [])
+              avisosPorGrupo.get(item.grupo)!.push(`Fila ${item.fila}: la superficie indicada (${item.declaradaHa.toFixed(4)} ha) supera la de SIGPAC (${supSigpacFila.toFixed(4)} ha); se usa la de SIGPAC.`)
+            }
+          }
+          supEfectivaPorGrupo.set(item.grupo, (supEfectivaPorGrupo.get(item.grupo) || 0) + efectiva)
         }
       })
 
@@ -337,7 +371,9 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
           observaciones: maestra.observaciones,
           refs: info.recintos,
           refsTexto: info.recintos.map((r: RecintoRef) => formatRefSigpac(r)),
-          supTotalHa: supTotal,
+          supTotalHa: supEfectivaPorGrupo.get(grupo) ?? supTotal,
+          supSigpacHa: supTotal,
+          avisosSuperficie: avisosPorGrupo.get(grupo) || [],
           features,
         })
       })
@@ -473,7 +509,9 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
           infoAdicional: p.observaciones,
           geojson: fusionado,
           parcelaInfo: info,
-          supHa: supTotal,
+          // Superficie cultivada: la indicada en el Excel (limitada a la de SIGPAC). La geometría guardada
+          // es la del recinto completo, igual que en las parcelas dibujadas con superficie menor.
+          supHa: p.supTotalHa,
           // Misma foto satélite (Esri, recortada al bbox) que usan las parcelas creadas a mano.
           imagenPreview: getEsriPreviewUrl(fusionado),
           fechaGuardado: new Date().toLocaleDateString('es-ES'),
@@ -534,7 +572,7 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
           {fase === 'subida' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
               <div style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.6 }}>
-                Sube un Excel con las columnas <code>grupo, nombre_parcela, sigpac_ref, cultivo, fecha_plantacion, finca, campana, observaciones</code>.
+                Sube un Excel con las columnas <code>grupo, nombre_parcela, sigpac_ref, cultivo, fecha_plantacion, finca, campana, observaciones, superficie</code> (superficie en ha, opcional).
                 Las filas con el mismo <code>grupo</code> se juntan en una sola parcela con varios recintos SIGPAC.
                 Si dejas <code>grupo</code> vacío, esa fila se importa como parcela individual (1 recinto).
                 La columna <code>campana</code> es opcional; si el nombre no existe todavía, te pediré sus fechas antes de confirmar la importación.
@@ -569,7 +607,9 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
                 <div key={i} style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--green-dim)', border: '1px solid rgba(31, 74, 40,0.2)', fontSize: 12 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>
                     <span>{p.nombre || (p.esIndividual ? '(parcela individual)' : `(grupo ${p.grupo})`)} — {p.cultivo || 'sin cultivo'}</span>
-                    <span style={{ color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{p.supTotalHa.toFixed(4)} ha</span>
+                    <span style={{ color: 'var(--muted)', fontFamily: 'var(--mono)' }}>
+                      {p.supTotalHa.toFixed(4)} ha{Math.abs(p.supTotalHa - p.supSigpacHa) > 1e-6 ? ` (de ${p.supSigpacHa.toFixed(4)} ha SIGPAC)` : ''}
+                    </span>
                   </div>
                   <div style={{ color: 'var(--muted)', fontFamily: 'var(--mono)', fontSize: 11 }}>
                     {p.refs.length} recinto{p.refs.length > 1 ? 's' : ''} SIGPAC: {p.refsTexto.join(', ')}
@@ -578,6 +618,7 @@ export default function ImportarParcelasExcel({ session, fincas, setFincas, camp
                     Finca: {p.fincaNombre || 'sin asignar'} {p.fechaPlantacion && `· Plantación: ${p.fechaPlantacion}`}
                   </div>
                   {p.campanaNombre && <div style={{ color: 'var(--amber)', fontSize: 11, marginTop: 2 }}>Campaña: {p.campanaNombre}</div>}
+                  {p.avisosSuperficie.map((a, k) => <div key={k} style={{ color: '#8A4B12', fontSize: 11, marginTop: 2 }}>⚠ {a}</div>)}
                   {p.observaciones && <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 2 }}>{p.observaciones}</div>}
                 </div>
               ))}
